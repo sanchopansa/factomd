@@ -691,6 +691,7 @@ func (c *Controller) broadcast(parcel Parcel, full bool) {
 		BlockFreeChannelSend(connection.SendChannel, ConnectionParcel{Parcel: parcel})
 		connection.peer.PrevMsgs.Add(msgHash) // record that we know this peer has seen this message
 	}
+
 	SentToPeers.Set(float64(numSent))
 }
 
