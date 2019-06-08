@@ -216,6 +216,7 @@ func (dbs *DBState) MarshalBinary() (rval []byte, err error) {
 	defer func(pe *error) {
 		if *pe != nil {
 			fmt.Fprintf(os.Stderr, "DBState.MarshalBinary err:%v", *pe)
+
 		}
 	}(&err)
 
@@ -1219,6 +1220,16 @@ func (list *DBStateList) ProcessBlocks(d *DBState) (progress bool) {
 		fs.(*FactoidState).DBHeight = dbht + 1
 	}
 
+	// Note about dbsigs.... If we processed the previous minute, then we generate the DBSig for the next block.
+	// But if we didn't process the previous block, like we start from scratch, or we had to reset the entire
+	// network, then no dbsig exists.  This code doesn't execute, and so we have no dbsig.  In that case, on
+	// the next EOM, we see the block hasn't been signed, and we sign the block (That is the call to SendDBSig()
+	// above).
+	pldbs := s.ProcessLists.Get(s.LLeaderHeight)
+	if s.Leader && !pldbs.DBSigAlreadySent {
+		s.SendDBSig(s.LLeaderHeight, s.LeaderVMIndex) // ProcessBlocks()
+	}
+
 	return
 }
 
@@ -1472,10 +1483,12 @@ func (list *DBStateList) SaveDBStateToDB(d *DBState) (progress bool) {
 			list.State.ExecuteFromHolding(eb.GetHeader().GetChainID().Fixed())
 		}
 	}
-	for _, e := range d.Entries {
-		// If it's in the DBlock
-		list.State.WriteEntry <- e
-	}
+	go func() {
+		for _, e := range d.Entries {
+			// If it's in the DBlock
+			list.State.WriteEntry <- e
+		}
+	}()
 	list.State.NumEntries += len(d.Entries)
 	list.State.NumEntryBlocks += len(d.EntryBlocks)
 
@@ -1500,6 +1513,7 @@ func (list *DBStateList) SaveDBStateToDB(d *DBState) (progress bool) {
 	if err := list.State.DB.ProcessDBlockMultiBatch(d.DirectoryBlock); err != nil {
 		panic(err.Error())
 	}
+
 	if err := list.State.DB.ExecuteMultiBatch(); err != nil {
 		panic(err.Error())
 	}
@@ -1511,7 +1525,11 @@ func (list *DBStateList) SaveDBStateToDB(d *DBState) (progress bool) {
 			if err != nil {
 				panic(err)
 			}
-			if _, ok := allowedEBlocks[keymr.Fixed()]; !ok {
+			if _, ok := allowedEBlocks[keymr.Fixed()]; ok {
+				for _, e := range eb.GetBody().GetEBEntries() {
+					pl.State.WriteEntry <- pl.GetNewEntry(e.Fixed())
+				}
+			} else {
 				list.State.LogPrintf("dbstateprocess", "Error saving eblock from process list, eblock not allowed")
 			}
 		}
@@ -1592,6 +1610,7 @@ func (list *DBStateList) SaveDBStateToDB(d *DBState) (progress bool) {
 }
 
 func (list *DBStateList) UpdateState() (progress bool) {
+
 	s := list.State
 	_ = s
 	if len(list.DBStates) != 0 {
