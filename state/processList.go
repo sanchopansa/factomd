@@ -930,7 +930,6 @@ func (p *ProcessList) Process(s *State) (progress bool) {
 					delete(s.Acks, msgHashFixed)
 					//delete(s.Holding, msgHashFixed)
 
-					// REVIEW: does this leave msg in dependent holding?
 					s.DeleteFromHolding(msgHashFixed, msg, "msg.Process done")
 				} else {
 					s.LogMessage("process", fmt.Sprintf("retry %v/%v/%v", p.DBHeight, i, j), msg)
@@ -1082,6 +1081,7 @@ func (p *ProcessList) AddToProcessList(s *State, ack *messages.Ack, m interfaces
 		s.LogPrintf("executeMsg", "m/ack mismatch m-%x a-%x", m.GetMsgHash().Fixed(), ack.GetHash().Fixed())
 	}
 
+
 	if ack.GetHash().Fixed() != m.GetMsgHash().Fixed() {
 		s.LogPrintf("executeMsg", "m/ack mismatch m-%x a-%x", m.GetMsgHash().Fixed(), ack.GetHash().Fixed())
 	}
@@ -1110,6 +1110,7 @@ func (p *ProcessList) AddToProcessList(s *State, ack *messages.Ack, m interfaces
 	// If we add the message to the process list, ensure we actually process that
 	// message, so the next msg will be able to added without going into holding.
 	if ack.IsLocal() {
+		ack.SetLocal(false)
 		for p.Process(s) {
 		}
 	}
