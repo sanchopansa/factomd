@@ -1178,7 +1178,7 @@ func (s *State) ExecuteEntriesInDBState(dbmsg *messages.DBStateMsg) {
 		return // Bad DBlock
 	}
 	for _, e := range dbmsg.Entries {
-		go func() { s.WriteEntry <- e }()
+		s.WriteEntry <- e
 	}
 	if err != nil {
 		consenLogger.WithFields(log.Fields{"func": "ExecuteEntriesInDBState", "height": height}).Errorf("Was unable to execute multibatch")

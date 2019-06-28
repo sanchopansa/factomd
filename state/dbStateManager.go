@@ -1483,12 +1483,10 @@ func (list *DBStateList) SaveDBStateToDB(d *DBState) (progress bool) {
 			list.State.ExecuteFromHolding(eb.GetHeader().GetChainID().Fixed())
 		}
 	}
-	go func() {
-		for _, e := range d.Entries {
-			// If it's in the DBlock
-			list.State.WriteEntry <- e
-		}
-	}()
+	for _, e := range d.Entries {
+		// If it's in the DBlock
+		list.State.WriteEntry <- e
+	}
 	list.State.NumEntries += len(d.Entries)
 	list.State.NumEntryBlocks += len(d.EntryBlocks)
 
