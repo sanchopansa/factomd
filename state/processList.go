@@ -43,8 +43,7 @@ type ProcessList struct {
 	VMs          []*VM       // Process list for each server (up to 32)
 	ServerMap    [10][64]int // Map of FedServers to all Servers for each minute
 	System       VM          // System Faults and other system wide messages
-	SysHighest   int
-	diffSigTally int /* Tally of how many VMs have provided different
+	diffSigTally int         /* Tally of how many VMs have provided different
 		                    					             Directory Block Signatures than what we have
 	                                            (discard DBlock if > 1/2 have sig differences) */
 	// messages processed in this list
@@ -752,11 +751,22 @@ func (p *ProcessList) decodeState(Syncing bool, DBSig bool, EOM bool, DBSigDone 
 
 var extraDebug bool = false
 
-// Process messages and update our state.
-func (p *ProcessList) Process(s *State) (progress bool) {
-	dbht := s.GetHighestSavedBlk()
-	if dbht >= p.DBHeight {
-		//s.AddStatus(fmt.Sprintf("ProcessList.Process: VM Height is %d and Saved height is %d", dbht, s.GetHighestSavedBlk()))
+func (p *ProcessList) processVM(vm *VM) (progress bool) {
+
+	i := vm.VmIndex
+	s := p.State
+	now := s.GetTimestamp()
+
+	if vm.Height == len(vm.List) {
+		// if we are syncing EOMs ...
+		if s.EOM {
+			// means that we are missing an EOM
+			vm.ReportMissing(vm.Height, 0) // ask for it now
+		}
+		// If we haven't heard anything from a VM in 2 seconds, ask for a message at the last-known height
+		if now.GetTimeMilli()-vm.ProcessTime.GetTimeMilli() > 2000 { // TODO: use FactomSeconds
+			vm.ReportMissing(vm.Height, 2000) // Ask for one past the end of the list
+		}
 		return false
 	}
 
@@ -930,6 +940,7 @@ func (p *ProcessList) Process(s *State) (progress bool) {
 					delete(s.Acks, msgHashFixed)
 					//delete(s.Holding, msgHashFixed)
 
+					// REVIEW: does this leave msg in dependent holding?
 					s.DeleteFromHolding(msgHashFixed, msg, "msg.Process done")
 				} else {
 					s.LogMessage("process", fmt.Sprintf("retry %v/%v/%v", p.DBHeight, i, j), msg)
@@ -1110,7 +1121,6 @@ func (p *ProcessList) AddToProcessList(s *State, ack *messages.Ack, m interfaces
 	// If we add the message to the process list, ensure we actually process that
 	// message, so the next msg will be able to added without going into holding.
 	if ack.IsLocal() {
-		ack.SetLocal(false)
 		for p.Process(s) {
 		}
 	}
