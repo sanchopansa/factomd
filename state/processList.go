@@ -770,197 +770,196 @@ func (p *ProcessList) processVM(vm *VM) (progress bool) {
 		return false
 	}
 
-	s.PLProcessHeight = p.DBHeight
+	if ValidationDebug {
+		s.LogPrintf("process", "start process for VM %d/%d/%d", vm.p.DBHeight, vm.VmIndex, vm.Height)
+		defer s.LogPrintf("process", "stop  process for VM %d/%d/%d", vm.p.DBHeight, vm.VmIndex, vm.Height)
+	}
 
-	now := s.GetTimestamp()
+	defer p.UpdateStatus(s) // update the status after each VM
 
-	for i := 0; i < len(p.FedServers); i++ {
-		vm := p.VMs[i]
+	progress = false // assume we will not process any messages
 
-		if vm.Height == len(vm.List) && s.Syncing && !vm.Synced {
-			// means that we are missing an EOM
-			vm.ReportMissing(vm.Height, 0)
+	for j := vm.Height; j < len(vm.List); j++ {
+
+		s.ProcessListProcessCnt++
+
+		if vm.List[j] == nil {
+			p.ReportAllMissing(vm)
+			return progress
 		}
 
-		// If we haven't heard anything from a VM in 2 seconds, ask for a message at the last-known height
-		if vm.Height == len(vm.List) && now.GetTimeMilli()-vm.ProcessTime.GetTimeMilli() > 2000 {
-			vm.ReportMissing(vm.Height, 2000) // Ask for one past the end of the list
+		if extraDebug {
+			s.LogMessage("process", fmt.Sprintf("Consider %v/%v/%v", p.DBHeight, i, j), vm.List[j])
 		}
 
-	VMListLoop:
-		for j := vm.Height; j < len(vm.List); j++ {
+		ack := vm.ListAck[j]
+		msg := vm.List[j]
 
-			s.ProcessListProcessCnt++
+		//todo: Need to re-validate the signatures of the message and ACK at this point to make sure they are current federated servers
 
-			x := p.decodeState(s.Syncing, s.DBSig, s.EOM, s.DBSigDone, s.EOMDone,
-				len(s.LeaderPL.FedServers), s.EOMProcessed, s.DBSigProcessed)
+		var expectedSerialHash interfaces.IHash
+		var err error
 
-			// Compute a syncing s string and report if it has changed
-			if x != "" && s.SyncingState[s.SyncingStateCurrent] != x {
-				s.LogPrintf("processStatus", x)
-				s.SyncingStateCurrent = (s.SyncingStateCurrent + 1) % len(s.SyncingState)
-				s.SyncingState[s.SyncingStateCurrent] = x
+		if vm.Height == 0 {
+			expectedSerialHash = ack.SerialHash
+		} else {
+			prevAck := vm.ListAck[vm.Height-1]
+			expectedSerialHash, err = primitives.CreateHash(prevAck.MessageHash, ack.MessageHash)
+			if err != nil {
+				p.RemoveFromPL(vm, j, "Error making hash "+err.Error())
+				return progress
 			}
-			if vm.List[j] == nil {
-				//p.State.AddStatus(fmt.Sprintf("ProcessList.go Process: Found nil list at vm %d vm height %d ", i, j))
-				cnt := 0
-				for k := j; k < len(vm.List); k++ {
-					if vm.List[k] == nil {
-						cnt++
-						vm.ReportMissing(k, 0)
-					}
-				}
-				if s.DebugExec() {
-					if vm.HighestNil < j {
-						s.LogPrintf("process", "%d nils  at  %v/%v/%v", cnt, p.DBHeight, i, j)
-						vm.HighestNil = j
-					}
-				}
+			s.LogPrintf("serialhashs", "%d/%d/%d\t%x %x", ack.DBHeight, ack.VMIndex, ack.Height, ack.SerialHash.Fixed(), expectedSerialHash.Fixed())
 
-				//				s.LogPrintf("process","nil  at  %v/%v/%v", p.DBHeight, i, j)
-				break VMListLoop
+			// compare the SerialHash of this acknowledgement with the
+			// expected serialHash (generated above)
+			if !expectedSerialHash.IsSameAs(ack.SerialHash) {
+				s.LogMessage("process", "prev msg", prevAck)
+				s.LogMessage("process", "this msg", ack)
+
+				s.LogPrintf("process", "expected %x", expectedSerialHash.Bytes())
+				s.LogPrintf("process", "ack      %x", ack.SerialHash.Bytes())
+				p.RemoveFromPL(vm, j, "ack hash mismatch")
+				return progress
 			}
+		}
 
-			if extraDebug {
-				s.LogMessage("process", fmt.Sprintf("Consider %v/%v/%v", p.DBHeight, i, j), vm.List[j])
-			}
+		// Try an process this message
+		now = p.State.GetTimestamp()
+		vm.ProcessTime = now
 
-			thisAck := vm.ListAck[j]
-			thisMsg := vm.List[j]
+		msgRepeatHashFixed := msg.GetRepeatHash().Fixed()
+		msgHashFixed := msg.GetMsgHash().Fixed()
 
-			//todo: Need to re-validate the signatures of the message and ACK at this point to make sure they are current federated servers
+		if _, valid := s.Replay.Valid(constants.INTERNAL_REPLAY, msgRepeatHashFixed, msg.GetTimestamp(), now); !valid {
+			p.RemoveFromPL(vm, j, "INTERNAL_REPLAY")
+			return progress
+		}
 
-			var expectedSerialHash interfaces.IHash
-			var err error
+		valid := msg.Validate(p.State)
+		if valid == -1 {
+			p.RemoveFromPL(vm, j, "hash invalid msg")
+			return progress
+		}
 
-			if vm.Height == 0 {
-				expectedSerialHash = thisAck.SerialHash
-			} else {
-				last := vm.ListAck[vm.Height-1]
-				expectedSerialHash, err = primitives.CreateHash(last.MessageHash, thisAck.MessageHash)
-				if err != nil {
-					s.LogMessage("process", fmt.Sprintf("nil out message %v/%v/%v, hash INTERNAL_REPLAY", p.DBHeight, i, j), vm.List[j]) //todo: revisit message
-					vm.List[j] = nil
-					if vm.HighestNil > j {
-						vm.HighestNil = j // Drag report limit back
-					}
-					if vm.HighestAsk > j {
-						vm.HighestAsk = j // Drag Ask limit back
-					}
-					//s.AddStatus(fmt.Sprintf("ProcessList.go Process: Error computing serial hash at dbht: %d vm %d  vm-height %d ", p.DBHeight, i, j))
-					vm.ReportMissing(j, 0)
-					//todo: report this... it's probably bad
-					break VMListLoop
-				}
+		if msg.Process(p.DBHeight, s) { // Try and Process this entry
+			p.State.LogMessage("processList", "done", msg)
+			vm.heartBeat = 0
+			vm.Height = j + 1 // Don't process it again if the process worked.
+			s.LogMessage("process", fmt.Sprintf("done %v/%v/%v", p.DBHeight, i, j), msg)
+			//s.LogPrintf("process", "thisAck  %x", thisAck.SerialHash.Bytes())
 
-				// compare the SerialHash of this acknowledgement with the
-				// expected serialHash (generated above)
-				if !expectedSerialHash.IsSameAs(thisAck.SerialHash) {
-					s.LogMessage("process", "SerialHash Mismatch", thisMsg)
-					s.LogMessage("process", "This ACK", thisAck)
-					s.LogMessage("process", "Prev ACK", last)
+			progress = true
 
-					s.LogPrintf("process", "expected %x", expectedSerialHash.Bytes())
-					s.LogPrintf("process", "thisAck  %x", thisAck.SerialHash.Bytes())
-					s.Reset() // This currently does nothing.. see comments in reset
-					//todo: report this... it's probably bad
-					return
-				}
-			}
+			// We have already tested and found m to be a new message.  We now record its hashes so later, we
+			// can detect that it has been recorded.  We don't care about the results of IsTSValidAndUpdateState at this point.
+			// block network replay too since we have already seen this message there is not need to see it again
+			s.Replay.IsTSValidAndUpdateState(constants.INTERNAL_REPLAY|constants.NETWORK_REPLAY, msgRepeatHashFixed, msg.GetTimestamp(), now)
+			s.Replay.IsTSValidAndUpdateState(constants.INTERNAL_REPLAY, msgHashFixed, msg.GetTimestamp(), now)
 
-			// So here is the deal.  After we have processed a block, we have to allow the DirectoryBlockSignatures a chance to save
-			// to disk.  Then we can insist on having the entry blocks.
-			diff := p.DBHeight - s.EntryDBHeightComplete
+			delete(s.Acks, msgHashFixed)
+			//delete(s.Holding, msgHashFixed)
 
-			// Keep in mind, the process list is processing at a height one greater than the database. 1 is caught up.  2 is one behind.
-			// Until the first couple signatures are processed, we will be 2 behind.
-			//TODO: Why is this in the execution per message per VM when it's global to the processlist -- clay
-			if s.WaitForEntries {
-				s.LogPrintf("processList", "s.WaitForEntries %d-:-%d [%d] > %d + 2", p.DBHeight, vm.LeaderMinute, s.EntryDBHeightComplete)
-				break VMListLoop // Don't process further in this list, go to the next.
-			}
-
-			// Try an process this message
-			msg := thisMsg
-			// If the block is not yet being written to disk (22 minutes old...)
-			// dif >2 means the second pass sync is not complete so don't process yet.
-			// this prevent you from becoming a leader when you don't have complete identities
-			if (vm.LeaderMinute < 2 && diff <= 3) || diff <= 2 {
-				// If we can't process this entry (i.e. returns false) then we can't process any more.
-				p.NextHeightToProcess[i] = j + 1 // unused...
-
-				now := p.State.GetTimestamp()
-
-				msgRepeatHashFixed := msg.GetRepeatHash().Fixed()
-				msgHashFixed := msg.GetMsgHash().Fixed()
-
-				if _, valid := s.Replay.Valid(constants.INTERNAL_REPLAY, msgRepeatHashFixed, msg.GetTimestamp(), now); !valid {
-					s.LogMessage("process", fmt.Sprintf("drop %v/%v/%v, hash INTERNAL_REPLAY", p.DBHeight, i, j), thisMsg)
-					vm.List[j] = nil // If we have seen this message, we don't process it again.  Ever.
-					if vm.HighestNil > j {
-						vm.HighestNil = j // Drag report limit back
-					}
-					if vm.HighestAsk > j {
-						vm.HighestAsk = j // Drag Ask limit back
-					}
-					//todo: report this... it's probably bad
-					vm.ReportMissing(j, 0)
-					break VMListLoop
-				}
-				vm.ProcessTime = now
-
-				valid := msg.Validate(p.State)
-				if valid == -1 { // TODO: Delete this repeated code block
-					s.LogMessage("process", fmt.Sprintf("drop %v/%v/%v, hash invalid msg", p.DBHeight, i, j), thisMsg)
-					vm.List[j] = nil // If we have seen this message, we don't process it again.  Ever.
-					if vm.HighestNil > j {
-						vm.HighestNil = j // Drag report limit back
-					}
-					if vm.HighestAsk > j {
-						vm.HighestAsk = j // Drag Ask limit back
-					}
-					//todo: report this... it's probably bad
-					vm.ReportMissing(j, 0)
-					break VMListLoop
-				} else if valid == 1 && msg.Process(p.DBHeight, s) { // Try and Process this entry
-					p.State.LogMessage("processList", "done", msg)
-					vm.heartBeat = 0
-					vm.Height = j + 1 // Don't process it again if the process worked.
-					s.LogMessage("process", fmt.Sprintf("done %v/%v/%v", p.DBHeight, i, j), msg)
-					//s.LogPrintf("process", "thisAck  %x", thisAck.SerialHash.Bytes())
-
-					progress = true
-
-					// We have already tested and found m to be a new message.  We now record its hashes so later, we
-					// can detect that it has been recorded.  We don't care about the results of IsTSValidAndUpdateState at this point.
-					// block network replay too since we have already seen this message there is not need to see it again
-					s.Replay.IsTSValidAndUpdateState(constants.INTERNAL_REPLAY|constants.NETWORK_REPLAY, msgRepeatHashFixed, msg.GetTimestamp(), now)
-					s.Replay.IsTSValidAndUpdateState(constants.INTERNAL_REPLAY, msgHashFixed, msg.GetTimestamp(), now)
-
-					delete(s.Acks, msgHashFixed)
-					//delete(s.Holding, msgHashFixed)
-
-					// REVIEW: does this leave msg in dependent holding?
-					s.DeleteFromHolding(msgHashFixed, msg, "msg.Process done")
-				} else {
-					s.LogMessage("process", fmt.Sprintf("retry %v/%v/%v", p.DBHeight, i, j), msg)
-					//s.AddStatus(fmt.Sprintf("processList.Process(): Could not process entry dbht: %d VM: %d  msg: [[%s]]", p.DBHeight, i, msg.String()))
-					break VMListLoop // Don't process further in this list, go to the next.
-				}
-			} else {
-				s.LogMessage("process", "Waiting on saving", msg)
-				s.LogPrintf("EntrySync", "Waiting on saving EntryDBHeightComplete = %d", s.EntryDBHeightComplete)
-
-				// If we don't have the Entry Blocks (or we haven't processed the signatures) we can't do more.
-				// p.State.AddStatus(fmt.Sprintf("Can't do more: dbht: %d vm: %d vm-height: %d Entry Height: %d", p.DBHeight, i, j, s.EntryDBHeightComplete))
-				if extraDebug {
-					p.State.LogPrintf("process", "Waiting on saving blocks to progress complete %d processing %d-:-%d", s.EntryDBHeightComplete, p.DBHeight, vm.LeaderMinute)
-				}
-				break VMListLoop
-			}
+			// REVIEW: does this leave msg in dependent holding?
+			s.DeleteFromHolding(msgHashFixed, msg, "msg.Process done")
+		} else {
+			s.LogMessage("process", fmt.Sprintf("retry %v/%v/%v", p.DBHeight, i, j), msg)
 		}
 	}
-	return
+	return progress
+} // processVM(){...}
+
+// scan the process and report all the missing messages
+func (p *ProcessList) ReportAllMissing(vm *VM) {
+	s := p.State
+	cnt := 0
+	for k := vm.Height; k < len(vm.List); k++ {
+		if vm.List[k] == nil {
+			cnt++
+			vm.ReportMissing(k, 0)
+		}
+	}
+	if s.DebugExec() {
+		if vm.HighestNil < vm.Height {
+			s.LogPrintf("process", "%d nils  at  %v/%v/%v", cnt, p.DBHeight, vm.VmIndex, vm.Height)
+			vm.HighestNil = vm.Height
+		}
+	}
+}
+
+func (p *ProcessList) RemoveFromPL(vm *VM, j int, reason string) {
+	p.State.LogMessage("process", fmt.Sprintf("nil out message %v/%v/%v, %s", p.DBHeight, vm.VmIndex, j, reason), vm.List[j]) //todo: revisit message
+
+	p.State.rejects <- MsgPair{vm.ListAck[j], vm.List[j]} // Notify MMR framework that we rejected this message
+
+	vm.List[j] = nil
+	if vm.HighestNil > j {
+		vm.HighestNil = j // Drag report limit back
+	}
+	if vm.HighestAsk >= j {
+		vm.HighestAsk = j - 1 // Drag Ask limit back
+	}
+	vm.ReportMissing(j, 0)
+}
+
+func (p *ProcessList) UpdateStatus(s *State) {
+	x := p.decodeState(s.Syncing, s.DBSig, s.EOM, s.DBSigDone, s.EOMDone,
+		len(s.LeaderPL.FedServers), s.EOMProcessed, s.DBSigProcessed)
+
+	// Compute a syncing s string and report if it has changed
+	if x != "" && s.SyncingState[s.SyncingStateCurrent] != x {
+		s.LogPrintf("processStatus", x)
+		s.SyncingStateCurrent = (s.SyncingStateCurrent + 1) % len(s.SyncingState)
+		s.SyncingState[s.SyncingStateCurrent] = x
+	}
+
+}
+
+// Process messages and update our state.
+func (p *ProcessList) Process(s *State) (progress bool) {
+	dbht := s.GetHighestSavedBlk()
+	if dbht >= p.DBHeight {
+		//s.AddStatus(fmt.Sprintf("ProcessList.Process: VM Height is %d and Saved height is %d", dbht, s.GetHighestSavedBlk()))
+		return false
+	}
+
+	// So here is the deal.  After we have processed a block, we have to allow the DirectoryBlockSignatures a chance to save
+	// to disk.  Then we can insist on having the entry blocks.
+	diff := (int(s.LLeaderHeight)*10 + int(s.CurrentMinute)) - int(s.EntryDBHeightComplete)*10
+
+	// Keep in mind, the process list is processing at a height one greater than the database. 1 is caught up.  2 is one behind.
+	// Until the first couple signatures are processed, we will be 2 behind.
+	//TODO: Why is this in the execution per message per VM when it's global to the processlist -- clay
+	if s.WaitForEntries {
+		s.LogPrintf("processList", "s.WaitForEntries %d-:-%d [%d] > %d + 2", p.DBHeight, s.CurrentMinute, s.EntryDBHeightComplete)
+		return progress // Don't process further in this list, go to the next.
+	}
+
+	// If the block is not yet being written to disk (22 minutes old...)
+	// dif >2 means the second pass sync is not complete so don't process yet.
+	// this prevent you from becoming a leader when you don't have complete identities
+	if diff > 22 {
+		s.LogPrintf("process", "Waiting on saving")
+		s.LogPrintf("EntrySync", "Waiting on saving EntryDBHeightComplete = %d", s.EntryDBHeightComplete)
+
+		// If we don't have the Entry Blocks (or we haven't processed the signatures) we can't do more.
+		// p.State.AddStatus(fmt.Sprintf("Can't do more: dbht: %d vm: %d vm-height: %d Entry Height: %d", p.DBHeight, i, j, s.EntryDBHeightComplete))
+		if extraDebug {
+			p.State.LogPrintf("process", "Waiting on saving blocks to progress complete %d processing %d-:-%d", s.EntryDBHeightComplete, s.LLeaderHeight, s.CurrentMinute)
+		}
+		return false
+	}
+
+	progress = false // assume  we will not get any work done.
+	s.PLProcessHeight = p.DBHeight
+
+	// Loop thru the VM processing as much as we can
+	for i := 0; i < len(p.FedServers); i++ {
+		vm := p.VMs[i]
+		p := p.processVM(vm)
+		progress = p || progress
+	}
+	return progress
 }
 
 func (p *ProcessList) AddToProcessList(s *State, ack *messages.Ack, m interfaces.IMsg) {
@@ -1091,7 +1090,6 @@ func (p *ProcessList) AddToProcessList(s *State, ack *messages.Ack, m interfaces
 	if ack.GetHash().Fixed() != m.GetMsgHash().Fixed() {
 		s.LogPrintf("executeMsg", "m/ack mismatch m-%x a-%x", m.GetMsgHash().Fixed(), ack.GetHash().Fixed())
 	}
-
 
 	if ack.GetHash().Fixed() != m.GetMsgHash().Fixed() {
 		s.LogPrintf("executeMsg", "m/ack mismatch m-%x a-%x", m.GetMsgHash().Fixed(), ack.GetHash().Fixed())
