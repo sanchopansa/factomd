@@ -179,6 +179,10 @@ type State struct {
 	apiQueue               APIMSGQueue
 	ackQueue               chan interfaces.IMsg
 	msgQueue               chan interfaces.IMsg
+	// prioritizedMsgQueue contains messages we know we need for consensus. (missing from processlist)
+	//		Currently messages from MMR handling can be put in here to fast track
+	//		them to the front.
+	prioritizedMsgQueue chan interfaces.IMsg
 
 	ShutdownChan chan int // For gracefully halting Factom
 	JournalFile  string
@@ -211,6 +215,10 @@ type State struct {
 	// own messages from the previously executing network can confuse you.
 	IgnoreDone    bool
 	IgnoreMissing bool
+
+	// Timout and Limit for outstanding missing DBState requests
+	RequestTimeout time.Duration
+	RequestLimit   int
 
 	LLeaderHeight   uint32
 	Leader          bool
@@ -295,7 +303,10 @@ type State struct {
 	Anchor interfaces.IAnchor
 
 	// Directory Block State
-	DBStates *DBStateList // Holds all DBStates not yet processed.
+	DBStates       *DBStateList // Holds all DBStates not yet processed.
+	StatesMissing  *StatesMissing
+	StatesWaiting  *StatesWaiting
+	StatesReceived *StatesReceived
 
 	// Having all the state for a particular directory block stored in one structure
 	// makes creating the next state, updating the various states, and setting up the next
@@ -416,10 +427,22 @@ type State struct {
 	processCnt            int64 // count of attempts to process .. so we can see if the thread is running
 	MMRInfo                     // fields for MMR processing
 
-	reportedActivations   [activations.ACTIVATION_TYPE_COUNT + 1]bool // flags about which activations we have reported (+1 because we don't use 0)
-	validatorLoopThreadID string
-
+	reportedActivations       [activations.ACTIVATION_TYPE_COUNT + 1]bool // flags about which activations we have reported (+1 because we don't use 0)
+	validatorLoopThreadID     string
+	OutputRegEx               *regexp.Regexp
+	OutputRegExString         string
+	InputRegEx                *regexp.Regexp
+	InputRegExString          string
 	executeRecursionDetection map[[32]byte]interfaces.IMsg
+	Hold                      HoldingList
+
+	// MissingMessageResponse is a cache of the last 1000 msgs we receive such that when
+	// we send out a missing message, we can find that message locally before we ask the net
+	RecentMessage
+
+	// MissingMessageResponseHandler is a cache of the last 2 blocks of processed acks.
+	// It can handle and respond to missing message requests on it's own thread.
+	MissingMessageResponseHandler *MissingMessageResponseCache
 }
 
 var _ interfaces.IState = (*State)(nil)
@@ -433,8 +456,8 @@ func (s *State) GetConfigPath() string {
 	return s.ConfigFilePath
 }
 
-func (s *State) Running() bool {
-	return s.IsRunning
+func (s *State) GetRunState() runstate.RunState {
+	return s.RunState
 }
 
 func (s *State) Clone(cloneNumber int) interfaces.IState {
@@ -468,6 +491,7 @@ func (s *State) Clone(cloneNumber int) interfaces.IState {
 
 	newState.FactomNodeName = s.Prefix + "FNode" + number
 	newState.FactomdVersion = s.FactomdVersion
+	newState.RunState = runstate.New // reset runstate since this clone will be started by sim node
 	newState.DropRate = s.DropRate
 	newState.LdbPath = s.LdbPath + "/Sim" + number
 	newState.JournalFile = s.LogPath + "/journal" + number + ".log"
@@ -542,6 +566,8 @@ func (s *State) Clone(cloneNumber int) interfaces.IState {
 	newState.RpcPass = s.RpcPass
 	newState.RpcAuthHash = s.RpcAuthHash
 
+	newState.RequestTimeout = s.RequestTimeout
+	newState.RequestLimit = s.RequestLimit
 	newState.FactomdTLSEnable = s.FactomdTLSEnable
 	newState.factomdTLSKeyFile = s.factomdTLSKeyFile
 	newState.factomdTLSCertFile = s.factomdTLSCertFile
@@ -781,6 +807,12 @@ func (s *State) LoadConfig(filename string, networkFlag string) {
 		s.ControlPanelPort = cfg.App.ControlPanelPort
 		s.RpcUser = cfg.App.FactomdRpcUser
 		s.RpcPass = cfg.App.FactomdRpcPass
+		// if RequestTimeout is not set by the configuration it will default to 0.
+		//		If it is 0, the loop that uses it will set it to the blocktime/20
+		//		We set it there, as blktime might change after this function (from mainnet selection)
+		s.RequestTimeout = time.Duration(cfg.App.RequestTimeout) * time.Second
+		s.RequestLimit = cfg.App.RequestLimit
+
 		s.StateSaverStruct.FastBoot = cfg.App.FastBoot
 		s.StateSaverStruct.FastBootLocation = cfg.App.FastBootLocation
 		s.FastBoot = cfg.App.FastBoot
@@ -901,7 +933,6 @@ func (s *State) GetSalt(ts interfaces.Timestamp) uint32 {
 }
 
 func (s *State) Init() {
-
 	if s.Salt == nil {
 		b := make([]byte, 32)
 		_, err := rand.Read(b)
@@ -975,7 +1006,7 @@ func (s *State) Init() {
 
 	// Set up maps for the followers
 	s.Holding = make(map[[32]byte]interfaces.IMsg)
-	s.HoldingList = make(chan [32]byte, 500)
+	s.HoldingList = make(chan [32]byte, 4000)
 	s.Acks = make(map[[32]byte]interfaces.IMsg)
 	s.Commits = NewSafeMsgMap("commits", s) //make(map[[32]byte]interfaces.IMsg)
 

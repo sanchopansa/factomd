@@ -10,6 +10,7 @@ import (
 	"hash"
 	"os"
 	"reflect"
+	"sort"
 	"time"
 
 	"github.com/FactomProject/factomd/common/constants"
@@ -22,8 +23,6 @@ import (
 	"github.com/FactomProject/factomd/common/primitives"
 	"github.com/FactomProject/factomd/util"
 	"github.com/FactomProject/factomd/util/atomic"
-
-	"sort"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -589,15 +588,9 @@ func (s *State) ReviewHolding() {
 		s.LogPrintf("executeMsg", "Start reviewHolding")
 		defer s.LogPrintf("executeMsg", "end reviewHolding holding=%d, xreview=%d", len(s.Holding), len(s.XReview))
 	}
-
 	s.Commits.Cleanup(s)
 	s.DB.Trim()
 
-	// Set the resend time at the END of the function. This prevents the time it takes to execute this function
-	// from reducing the time we allow before another review
-	defer func() {
-		s.ResendHolding = now
-	}()
 	// Anything we are holding, we need to reprocess.
 	s.XReview = make([]interfaces.IMsg, 0)
 
@@ -661,135 +654,128 @@ processholdinglist:
 			break processholdinglist
 		}
 
-	for k, v := range s.Holding {
-		if int(highest)-int(saved) > 1000 {
-			TotalHoldingQueueOutputs.Inc()
-			//delete(s.Holding, k)
-			s.DeleteFromHolding(k, v, "HKB-HSB>1000")
-			continue processholdinglist // No point in executing if we think we can't hold this.
-		}
-
-		if v.Expire(s) {
-			s.LogMessage("executeMsg", "expire from holding", v)
-			s.ExpireCnt++
-			TotalHoldingQueueOutputs.Inc()
-			//delete(s.Holding, k)
-			s.DeleteFromHolding(k, v, "expired")
-			continue processholdinglist // If the message has expired, don't hold or execute
-		}
-
-		eom, ok := v.(*messages.EOM)
-		if ok {
-			if int(eom.DBHeight)*10+int(eom.Minute) < int(s.LLeaderHeight)*10+s.CurrentMinute {
-				s.DeleteFromHolding(k, v, "old EOM")
-				continue processholdinglist
-			}
-			if !eom.IsLocal() && eom.DBHeight > saved {
-				s.HighestKnown = eom.DBHeight
-			}
-			go func() { s.msgQueue <- eom }()
-			continue processholdinglist
-		}
-
-		dbsigmsg, ok := v.(*messages.DirectoryBlockSignature)
-		if ok {
-			if dbsigmsg.DBHeight < s.LLeaderHeight || (s.CurrentMinute > 0 && dbsigmsg.DBHeight == s.LLeaderHeight) {
+		for k, v := range s.Holding {
+			if int(highest)-int(saved) > 1000 {
 				TotalHoldingQueueOutputs.Inc()
 				//delete(s.Holding, k)
-				s.DeleteFromHolding(k, v, "Old DBSig")
-				continue processholdinglist
+				s.DeleteFromHolding(k, v, "HKB-HSB>1000")
+				continue processholdinglist // No point in executing if we think we can't hold this.
 			}
-			if !dbsigmsg.IsLocal() && dbsigmsg.DBHeight > saved {
-				s.HighestKnown = dbsigmsg.DBHeight
-			}
-		}
 
-		dbsmsg, ok := v.(*messages.DBStateMsg)
-		if ok && dbsmsg.DirectoryBlock.GetHeader().GetDBHeight() <= saved && saved > 0 {
-
-			TotalHoldingQueueOutputs.Inc()
-			//delete(s.Holding, k)
-			s.DeleteFromHolding(k, v, "old DBState")
-			continue processholdinglist
-		}
-
-		// If it is an entryCommit/ChainCommit/RevealEntry and it has a duplicate hash to an existing entry throw it away here
-
-		ce, ok := v.(*messages.CommitEntryMsg)
-		if ok {
-			x := s.NoEntryYet(ce.CommitEntry.EntryHash, ce.CommitEntry.GetTimestamp())
-			if !x {
+			if v.Expire(s) {
+				s.LogMessage("executeMsg", "expire from holding", v)
+				s.ExpireCnt++
 				TotalHoldingQueueOutputs.Inc()
-				//delete(s.Holding, k) // Drop commits with the same entry hash from holding because they are blocked by a previous entry
-				s.DeleteFromHolding(k, v, "already committed")
-				continue processholdinglist
+				//delete(s.Holding, k)
+				s.DeleteFromHolding(k, v, "expired")
+				continue processholdinglist // If the message has expired, don't hold or execute
 			}
-		}
 
-		// If it is an chainCommit and it has a duplicate hash to an existing entry throw it away here
+			eom, ok := v.(*messages.EOM)
+			if ok {
+				if int(eom.DBHeight)*10+int(eom.Minute) < int(s.LLeaderHeight)*10+s.CurrentMinute {
+					s.DeleteFromHolding(k, v, "old EOM")
+					continue processholdinglist
+				}
+				if !eom.IsLocal() && eom.DBHeight > saved {
+					s.HighestKnown = eom.DBHeight
+				}
+			}
 
-		cc, ok := v.(*messages.CommitChainMsg)
-		if ok {
-			x := s.NoEntryYet(cc.CommitChain.EntryHash, cc.CommitChain.GetTimestamp())
-			if !x {
+			dbsigmsg, ok := v.(*messages.DirectoryBlockSignature)
+			if ok {
+				if dbsigmsg.DBHeight < s.LLeaderHeight || (s.CurrentMinute > 0 && dbsigmsg.DBHeight == s.LLeaderHeight) {
+					TotalHoldingQueueOutputs.Inc()
+					//delete(s.Holding, k)
+					s.DeleteFromHolding(k, v, "Old DBSig")
+					continue processholdinglist
+				}
+				if !dbsigmsg.IsLocal() && dbsigmsg.DBHeight > saved {
+					s.HighestKnown = dbsigmsg.DBHeight
+				}
+			}
+
+			dbsmsg, ok := v.(*messages.DBStateMsg)
+			if ok && dbsmsg.DirectoryBlock.GetHeader().GetDBHeight() <= saved && saved > 0 {
+
 				TotalHoldingQueueOutputs.Inc()
-				//delete(s.Holding, k) // Drop commits with the same entry hash from holding because they are blocked by a previous entry
-				s.DeleteFromHolding(k, v, "already committed")
+				//delete(s.Holding, k)
+				s.DeleteFromHolding(k, v, "old DBState")
 				continue processholdinglist
 			}
-		}
 
-		validToSend, validToExecute := s.Validate(v)
+			// If it is an entryCommit/ChainCommit/RevealEntry and it has a duplicate hash to an existing entry throw it away here
+			ce, ok := v.(*messages.CommitEntryMsg)
+			if ok {
+				x := s.NoEntryYet(ce.CommitEntry.EntryHash, ce.CommitEntry.GetTimestamp())
+				if !x {
+					TotalHoldingQueueOutputs.Inc()
+					//delete(s.Holding, k) // Drop commits with the same entry hash from holding because they are blocked by a previous entry
+					s.DeleteFromHolding(k, v, "already committed")
+					continue processholdinglist
+				}
+			}
 
-		if validToSend > 0 {
-			v.SendOut(s, v)
-		}
+			// If it is an chainCommit and it has a duplicate hash to an existing entry throw it away here
 
-		switch validToExecute {
-		case -1:
-			s.LogMessage("executeMsg", "invalid from holding", v)
+			cc, ok := v.(*messages.CommitChainMsg)
+			if ok {
+				x := s.NoEntryYet(cc.CommitChain.EntryHash, cc.CommitChain.GetTimestamp())
+				if !x {
+					TotalHoldingQueueOutputs.Inc()
+					//delete(s.Holding, k) // Drop commits with the same entry hash from holding because they are blocked by a previous entry
+					s.DeleteFromHolding(k, v, "already committed")
+					continue processholdinglist
+				}
+			}
+
+			validToSend, validToExecute := s.Validate(v)
+
+			if validToSend > 0 {
+				v.SendOut(s, v)
+			}
+
+			switch validToExecute {
+			case -1:
+				s.LogMessage("executeMsg", "invalid from holding", v)
+				TotalHoldingQueueOutputs.Inc()
+				//delete(s.Holding, k)
+				s.DeleteFromHolding(k, v, "invalid from holding")
+				continue processholdinglist
+			case 0:
+				continue processholdinglist
+			}
+
+			// if it is a Factoid or entry credit transaction then check BLOCK_REPLAY
+			switch v.Type() {
+			case constants.FACTOID_TRANSACTION_MSG, constants.COMMIT_CHAIN_MSG, constants.COMMIT_ENTRY_MSG:
+				ok2 := s.FReplay.IsHashUnique(constants.BLOCK_REPLAY, v.GetRepeatHash().Fixed())
+				if !ok2 {
+					s.DeleteFromHolding(k, v, "BLOCK_REPLAY")
+					continue processholdinglist
+				}
+			default:
+			}
+			// If a Reveal Entry has a commit available, then process the Reveal Entry and send it out.
+			if re, ok := v.(*messages.RevealEntryMsg); ok {
+				if !s.NoEntryYet(re.GetHash(), s.GetLeaderTimestamp()) {
+					s.DeleteFromHolding(re.GetHash().Fixed(), re, "already committed reveal")
+					s.Commits.Delete(re.GetHash().Fixed())
+					continue processholdinglist
+				}
+				// Needs to be our VMIndex as well, or ignore.
+				if re.GetVMIndex() != s.LeaderVMIndex || !s.Leader {
+					continue processholdinglist // If we are a leader, but it isn't ours, and it isn't a new minute, ignore.
+				}
+			}
+
+			TotalXReviewQueueInputs.Inc()
+			s.XReview = append(s.XReview, v)
 			TotalHoldingQueueOutputs.Inc()
-			//delete(s.Holding, k)
-			s.DeleteFromHolding(k, v, "invalid from holding")
-			continue processholdinglist
-		case 0:
-			continue processholdinglist
 		}
-
-		// if it is a Factoid or entry credit transaction then check BLOCK_REPLAY
-		switch v.Type() {
-		case constants.FACTOID_TRANSACTION_MSG, constants.COMMIT_CHAIN_MSG, constants.COMMIT_ENTRY_MSG:
-			ok2 := s.FReplay.IsHashUnique(constants.BLOCK_REPLAY, v.GetRepeatHash().Fixed())
-			if !ok2 {
-				s.DeleteFromHolding(k, v, "BLOCK_REPLAY")
-				continue processholdinglist
-			}
-		default:
-		}
-
-		// If a Reveal Entry has a commit available, then process the Reveal Entry and send it out.
-		if re, ok := v.(*messages.RevealEntryMsg); ok {
-			if !s.NoEntryYet(re.GetHash(), s.GetLeaderTimestamp()) {
-				s.DeleteFromHolding(re.GetHash().Fixed(), re, "already committed reveal")
-				s.Commits.Delete(re.GetHash().Fixed())
-				continue processholdinglist
-			}
-
-			// Needs to be our VMIndex as well, or ignore.
-			if re.GetVMIndex() != s.LeaderVMIndex || !s.Leader {
-				continue processholdinglist // If we are a leader, but it isn't ours, and it isn't a new minute, ignore.
-			}
-		}
-
-		TotalXReviewQueueInputs.Inc()
-		s.XReview = append(s.XReview, v)
-		TotalHoldingQueueOutputs.Inc()
-		if len(s.XReview) > 200 {
-			break
-		}
+		reviewHoldingTime := time.Since(preReviewHoldingTime)
+		TotalReviewHoldingTime.Add(float64(reviewHoldingTime.Nanoseconds()))
 	}
-	reviewHoldingTime := time.Since(preReviewHoldingTime)
-	TotalReviewHoldingTime.Add(float64(reviewHoldingTime.Nanoseconds()))
 }
 
 func (s *State) MoveStateToHeight(dbheight uint32, newMinute int) {
@@ -803,7 +789,6 @@ func (s *State) MoveStateToHeight(dbheight uint32, newMinute int) {
 		if s.LLeaderHeight != dbheight {
 			fmt.Fprintf(os.Stderr, "State move between non-sequential heights from %d to %d\n", s.LLeaderHeight, dbheight)
 		}
-
 		//force sync state to a rational  state for between minutes
 		s.Syncing = false    // movestatetoheight
 		s.EOM = false        // movestatetoheight
@@ -818,7 +803,6 @@ func (s *State) MoveStateToHeight(dbheight uint32, newMinute int) {
 				vm.Synced = false // movestatetoheight
 			}
 		}
-
 	}
 	// normally when loading by DBStates we jump from minute 0 to minute 0
 	// when following by minute we jump from minute 10 to minute 0
@@ -869,7 +853,8 @@ func (s *State) MoveStateToHeight(dbheight uint32, newMinute int) {
 		authlistMsg := s.EFactory.NewAuthorityListInternal(s.LeaderPL.FedServers, s.LeaderPL.AuditServers, s.LLeaderHeight)
 		s.ElectionsQueue().Enqueue(authlistMsg)
 
-		if s.Leader && !s.LeaderPL.DBSigAlreadySent {
+		// Do not send out dbsigs while loading from disk
+		if s.Leader && !s.LeaderPL.DBSigAlreadySent && s.LLeaderHeight > s.DBHeightAtBoot {
 			s.SendDBSig(s.LLeaderHeight, s.LeaderVMIndex) // MoveStateToHeight()
 		}
 		s.DBStates.UpdateState() // go process the DBSigs
@@ -885,7 +870,6 @@ func (s *State) MoveStateToHeight(dbheight uint32, newMinute int) {
 		}
 		s.CurrentMinute = newMinute                                                            // Update just the minute
 		s.Leader, s.LeaderVMIndex = s.LeaderPL.GetVirtualServers(newMinute, s.IdentityChainID) // MoveStateToHeight minute
-
 		s.LogPrintf("executeMsg", "MoveStateToHeight new minute set leader=%v, vmIndex = %v", s.Leader, s.LeaderVMIndex)
 		// We are between blocks make sure we are setup to sync
 		// should already be true but if a DBSTATE got processed mid block
@@ -896,7 +880,6 @@ func (s *State) MoveStateToHeight(dbheight uint32, newMinute int) {
 		// If an election took place, our lists will be unsorted. Fix that
 		s.LeaderPL.SortAuditServers()
 		s.LeaderPL.SortFedServers()
-
 	}
 
 	{ // debug
@@ -918,7 +901,6 @@ func (s *State) MoveStateToHeight(dbheight uint32, newMinute int) {
 	// set the limits because we might have added servers
 	s.EOMLimit = len(s.LeaderPL.FedServers) // We add or remove server only on block boundaries
 	s.DBSigLimit = s.EOMLimit               // We add or remove server only on block boundaries
-
 	s.LogPrintf("dbstateprocess", "MoveStateToHeight(%d-:-%d) leader=%v leaderPL=%p, leaderVMIndex=%d", dbheight, newMinute, s.Leader, s.LeaderPL, s.LeaderVMIndex)
 
 	s.Hold.ExecuteForNewHeight(dbheight) // execute held messages
@@ -964,7 +946,6 @@ func (s *State) AddDBState(isNew bool,
 	}
 	if ht > s.LLeaderHeight {
 		s.LogPrintf("dbstateprocess", "unexpected: ht > s.LLeaderHeight  at %d added %d", s.LLeaderHeight, ht)
-
 		//fmt.Println(fmt.Sprintf("SigType PROCESS: %10s Add DBState: s.SigType(%v)", s.FactomNodeName, s.SigType))
 		s.MoveStateToHeight(ht, 0) // AddDBState()
 		s.StartDelay = s.GetTimestamp().GetTimeMilli()
@@ -1125,6 +1106,7 @@ func (s *State) FollowerExecuteAck(msg interfaces.IMsg) {
 	s.Acks[ack.GetHash().Fixed()] = ack
 	// check if we have a message
 	m, _ := s.Holding[ack.GetHash().Fixed()]
+	s.LogMessage("newHolding", "FollowerExecuteAck ", m)
 
 	if m != nil {
 		// We have an ack and a matching message go execute the message!
@@ -1138,6 +1120,41 @@ func (s *State) FollowerExecuteAck(msg interfaces.IMsg) {
 		s.LogMessage("executeMsg", "No Msg, keep", ack)
 		//todo: should we ask MMR here?
 	}
+}
+
+func (s *State) ExecuteEntriesInDBState(dbmsg *messages.DBStateMsg) {
+	height := dbmsg.DirectoryBlock.GetDatabaseHeight()
+
+	if s.EntryDBHeightComplete > height {
+		return
+	}
+	s.LogPrintf("dbstateprocess", "Process entries in %d", height)
+	// If no Eblocks, leave
+	if len(dbmsg.EBlocks) == 0 {
+		return
+	}
+
+	// All DBStates that got here are valid, so just checking the DBlock hash works
+	dblock, err := s.DB.FetchDBlockByHeight(height)
+	if err != nil || dblock == nil {
+		consenLogger.WithFields(log.Fields{"func": "ExecuteEntriesInDBState", "height": height}).Warnf("Dblock fetched is nil")
+		return // This is a weird case
+	}
+
+	if !dbmsg.DirectoryBlock.GetHash().IsSameAs(dblock.GetHash()) {
+		consenLogger.WithFields(log.Fields{"func": "ExecuteEntriesInDBState", "height": height}).Errorf("Bad DBState. DBlock does not match found")
+		return // Bad DBlock
+	}
+
+	for _, e := range dbmsg.Entries {
+		s.WriteEntry <- e
+	}
+
+	if err != nil {
+		consenLogger.WithFields(log.Fields{"func": "ExecuteEntriesInDBState", "height": height}).Errorf("Was unable to execute multibatch")
+		return
+	}
+	// todo: Should we move the EntryDBHeightComplete here?
 }
 
 func (s *State) FollowerExecuteDBState(msg interfaces.IMsg) {
@@ -1402,8 +1419,9 @@ func (s *State) FollowerExecuteDataResponse(m interfaces.IMsg) {
 		if !ok {
 			return
 		}
-		s.WriteEntry <- entry // DataResponse
-
+		if len(s.WriteEntry) < cap(s.WriteEntry) {
+			s.WriteEntry <- entry // DataResponse
+		}
 	}
 }
 
@@ -1808,7 +1826,7 @@ func (s *State) ProcessCommitChain(dbheight uint32, commitChain interfaces.IMsg)
 		if entry != nil {
 			s.repost(entry, 0) // Try and execute the reveal for this commit
 		}
-		//s.LogMessage("newHolding", "process", commitChain)
+		//s.LogMessage("dependentHolding", "process", commitChain)
 		s.ExecuteFromHolding(commitChain.GetHash().Fixed()) // process CommitChain
 		return true
 	}
@@ -1831,7 +1849,7 @@ func (s *State) ProcessCommitEntry(dbheight uint32, commitEntry interfaces.IMsg)
 		if entry != nil {
 			s.repost(entry, 0) // Try and execute the reveal for this commit
 		}
-		//		s.LogMessage("newHolding", "process", commitEntry)
+		//		s.LogMessage("dependentHolding", "process", commitEntry)
 		s.ExecuteFromHolding(commitEntry.GetHash().Fixed()) // process CommitEntry
 		return true
 	}
@@ -1889,7 +1907,7 @@ func (s *State) ProcessRevealEntry(dbheight uint32, m interfaces.IMsg) (worked b
 		s.WriteEntry <- msg.Entry
 		s.IncEntryChains()
 		s.IncEntries()
-		//		s.LogMessage("newHolding", "process", m)
+		//		s.LogMessage("dependentHolding", "process", m)
 		s.ExecuteFromHolding(chainID.Fixed()) // Process Reveal for Chain
 
 		return true
@@ -2195,6 +2213,9 @@ func (s *State) ProcessEOM(dbheight uint32, msg interfaces.IMsg) bool {
 		//fmt.Println(fmt.Sprintf("EOM PROCESS: %10s vm %2d EOMProcessed++ (%2d)", s.FactomNodeName, e.VMIndex, s.EOMProcessed))
 		vm.Synced = true // ProcessEOM
 		markNoFault(pl, msg.GetVMIndex())
+		if s.LeaderPL.SysHighest < int(e.SysHeight) {
+			s.LeaderPL.SysHighest = int(e.SysHeight)
+		}
 		//fmt.Println(fmt.Sprintf("SigType PROCESS: %10s vm %2d Process this SigType: return on s.SigType(%v) && int(e.Minute(%v)) > s.EOMMinute(%v)", s.FactomNodeName, e.VMIndex, s.SigType, e.Minute, s.EOMMinute))
 		return false
 	}
@@ -2427,7 +2448,7 @@ func (s *State) ProcessDBSig(dbheight uint32, msg interfaces.IMsg) bool {
 			s.LogMessage("processList", "drop from pl", vm.ListAck[0])
 			vm.ListAck[0] = nil
 			vm.List[0] = nil
-			vm.HighestAsk = 0
+			vm.HighestAsk = -1
 			vm.HighestNil = 0
 			return false
 		}
@@ -2444,7 +2465,7 @@ func (s *State) ProcessDBSig(dbheight uint32, msg interfaces.IMsg) bool {
 			s.LogMessage("processList", "drop from pl", vm.ListAck[0])
 			vm.ListAck[0] = nil
 			vm.List[0] = nil
-			vm.HighestAsk = 0
+			vm.HighestAsk = -1
 			vm.HighestNil = 0
 			return false
 		}
@@ -2458,7 +2479,7 @@ func (s *State) ProcessDBSig(dbheight uint32, msg interfaces.IMsg) bool {
 			s.LogMessage("processList", "drop from pl", vm.ListAck[0])
 			vm.ListAck[0] = nil
 			vm.List[0] = nil
-			vm.HighestAsk = 0
+			vm.HighestAsk = -1
 			vm.HighestNil = 0
 			return false
 		}
