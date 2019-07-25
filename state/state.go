@@ -199,8 +199,8 @@ type State struct {
 	RpcAuthHash []byte
 
 	FactomdTLSEnable   bool
-	factomdTLSKeyFile  string
-	factomdTLSCertFile string
+	FactomdTLSKeyFile  string
+	FactomdTLSCertFile string
 	FactomdLocations   string
 
 	CorsDomains []string
@@ -443,6 +443,8 @@ type State struct {
 	// MissingMessageResponseHandler is a cache of the last 2 blocks of processed acks.
 	// It can handle and respond to missing message requests on it's own thread.
 	MissingMessageResponseHandler *MissingMessageResponseCache
+	ChainCommits                  Last100
+	Reveals                       Last100
 }
 
 var _ interfaces.IState = (*State)(nil)
@@ -569,8 +571,8 @@ func (s *State) Clone(cloneNumber int) interfaces.IState {
 	newState.RequestTimeout = s.RequestTimeout
 	newState.RequestLimit = s.RequestLimit
 	newState.FactomdTLSEnable = s.FactomdTLSEnable
-	newState.factomdTLSKeyFile = s.factomdTLSKeyFile
-	newState.factomdTLSCertFile = s.factomdTLSCertFile
+	newState.FactomdTLSKeyFile = s.FactomdTLSKeyFile
+	newState.FactomdTLSCertFile = s.FactomdTLSCertFile
 	newState.FactomdLocations = s.FactomdLocations
 
 	newState.FastSaveRate = s.FastSaveRate
@@ -677,7 +679,7 @@ func (s *State) GetRpcAuthHash() []byte {
 }
 
 func (s *State) GetTlsInfo() (bool, string, string) {
-	return s.FactomdTLSEnable, s.factomdTLSKeyFile, s.factomdTLSCertFile
+	return s.FactomdTLSEnable, s.FactomdTLSKeyFile, s.FactomdTLSCertFile
 }
 
 func (s *State) GetFactomdLocations() string {
@@ -834,12 +836,36 @@ func (s *State) LoadConfig(filename string, networkFlag string) {
 			}
 		}
 		s.FactomdTLSEnable = cfg.App.FactomdTlsEnabled
+
+		FactomdTLSKeyFile := cfg.App.FactomdTlsPrivateKey
 		if cfg.App.FactomdTlsPrivateKey == "/full/path/to/factomdAPIpriv.key" {
-			s.factomdTLSKeyFile = fmt.Sprint(cfg.App.HomeDir, "factomdAPIpriv.key")
+			FactomdTLSKeyFile = fmt.Sprint(cfg.App.HomeDir, "factomdAPIpriv.key")
 		}
+		if s.FactomdTLSKeyFile != FactomdTLSKeyFile {
+			if s.FactomdTLSEnable {
+				if _, err := os.Stat(FactomdTLSKeyFile); os.IsNotExist(err) {
+					fmt.Fprint(os.Stderr, "Configured file does not exits: %s\n", FactomdTLSKeyFile)
+				}
+			}
+			s.FactomdTLSKeyFile = FactomdTLSKeyFile // set state
+		}
+
+		FactomdTLSCertFile := cfg.App.FactomdTlsPublicCert
 		if cfg.App.FactomdTlsPublicCert == "/full/path/to/factomdAPIpub.cert" {
-			s.factomdTLSCertFile = fmt.Sprint(cfg.App.HomeDir, "factomdAPIpub.cert")
+			s.FactomdTLSCertFile = fmt.Sprint(cfg.App.HomeDir, "factomdAPIpub.cert")
 		}
+		if s.FactomdTLSCertFile != FactomdTLSCertFile {
+			if s.FactomdTLSEnable {
+				if _, err := os.Stat(FactomdTLSCertFile); os.IsNotExist(err) {
+					fmt.Fprint(os.Stderr, "Configured file does not exits: %s\n", FactomdTLSCertFile)
+				}
+			}
+			s.FactomdTLSCertFile = FactomdTLSCertFile // set state
+		}
+
+		s.FactomdTLSEnable = cfg.App.FactomdTlsEnabled
+		s.FactomdTLSKeyFile = cfg.App.FactomdTlsPrivateKey
+
 		externalIP := strings.Split(cfg.Walletd.FactomdLocation, ":")[0]
 		if externalIP != "localhost" {
 			s.FactomdLocations = externalIP
@@ -1006,7 +1032,6 @@ func (s *State) Init() {
 
 	// Set up maps for the followers
 	s.Holding = make(map[[32]byte]interfaces.IMsg)
-	s.HoldingList = make(chan [32]byte, 4000)
 	s.Acks = make(map[[32]byte]interfaces.IMsg)
 	s.Commits = NewSafeMsgMap("commits", s) //make(map[[32]byte]interfaces.IMsg)
 
@@ -1148,7 +1173,6 @@ func (s *State) Init() {
 	s.asks = make(chan askRef, 5)
 	s.adds = make(chan plRef, 5)
 	s.dbheights = make(chan int, 1)
-	s.rejects = make(chan MsgPair, 1) // Messages rejected from process list
 
 	// Allocate the missing message handler
 	s.MissingMessageResponseHandler = NewMissingMessageReponseCache(s)
@@ -1189,7 +1213,6 @@ func (s *State) Init() {
 		}
 	}
 
-	s.startMMR()
 	if globals.Params.WriteProcessedDBStates {
 		path := filepath.Join(s.LdbPath, s.Network, "dbstates")
 		os.MkdirAll(path, 0775)
@@ -1980,8 +2003,6 @@ func (s *State) UpdateState() (progress bool) {
 			progress = ProcessLists.UpdateState(dbheight)
 		}
 	}
-
-	s.DBStates.Catchup()
 
 	s.SetString()
 	if s.ControlPanelDataRequest {
