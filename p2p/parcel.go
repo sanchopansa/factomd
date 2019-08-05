@@ -11,8 +11,6 @@ import (
 
 	"github.com/FactomProject/factomd/common/interfaces"
 	log "github.com/sirupsen/logrus"
-	"github.com/FactomProject/factomd/electionsCore/imessage"
-	"github.com/FactomProject/factomd/common/interfaces"
 )
 
 var parcelLogger = packageLogger.WithField("subpack", "connection")
